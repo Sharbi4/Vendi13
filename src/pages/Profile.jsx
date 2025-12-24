@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { base44 } from '@/api/base44Client';
+import { supabase, getCurrentUser, onAuthStateChange } from '@/lib/supabase';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -28,8 +28,11 @@ import StripeIdentityVerification from '../components/verification/StripeIdentit
 import ListingAnalytics from '../components/listings/ListingAnalytics';
 
 export default function Profile() {
+  const navigate = useNavigate();
   const [user, setUser] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
   const [editedName, setEditedName] = useState('');
   const [editedPhone, setEditedPhone] = useState('');
@@ -53,19 +56,63 @@ export default function Profile() {
   const [expandedAnalytics, setExpandedAnalytics] = useState(null);
   const queryClient = useQueryClient();
 
+  // Check authentication and load user profile
   useEffect(() => {
-    checkAuth();
-  }, []);
+    const checkAuth = async () => {
+      setIsLoading(true);
+      try {
+        const { user: authUser, error } = await getCurrentUser();
+        
+        if (error || !authUser) {
+          // Redirect to login
+          navigate('/login?redirect=/Profile');
+          return;
+        }
 
-  const checkAuth = async () => {
-    const authenticated = await base44.auth.isAuthenticated();
-    if (!authenticated) {
-      base44.auth.redirectToLogin(createPageUrl('Profile'));
-      return;
-    }
-    setIsAuthenticated(authenticated);
-    const userData = await base44.auth.me();
-    setUser(userData);
+        setUser(authUser);
+        setIsAuthenticated(true);
+
+        // Fetch user profile from users table
+        const { data: profile, error: profileError } = await supabase
+          .from('users')
+          .select('*')
+          .eq('id', authUser.id)
+          .single();
+
+        if (profileError && profileError.code !== 'PGRST116') {
+          console.error('Error fetching profile:', profileError);
+        }
+
+        const userData = profile || {
+          id: authUser.id,
+          email: authUser.email,
+          full_name: authUser.user_metadata?.full_name || '',
+          created_at: authUser.created_at
+        };
+
+        setUserProfile(userData);
+        initializeEditFields(userData);
+      } catch (err) {
+        console.error('Auth check error:', err);
+        navigate('/login?redirect=/Profile');
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    checkAuth();
+
+    // Subscribe to auth changes
+    const { data: { subscription } } = onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT') {
+        navigate('/login');
+      }
+    });
+
+    return () => subscription?.unsubscribe();
+  }, [navigate]);
+
+  const initializeEditFields = (userData) => {
     setEditedName(userData.full_name || '');
     setEditedPhone(userData.phone_number || '');
     setEditedAddress(userData.address || '');
@@ -85,86 +132,136 @@ export default function Profile() {
 
   // Fetch user's listings
   const { data: myListings = [] } = useQuery({
-    queryKey: ['profile-listings', user?.email],
+    queryKey: ['profile-listings', user?.id],
     queryFn: async () => {
-      if (!user?.email) return [];
-      return await base44.entities.Listing.filter({ created_by: user.email }, '-created_date');
+      if (!user?.id) return [];
+      const { data, error } = await supabase
+        .from('listings')
+        .select('*')
+        .eq('created_by', user.id)
+        .order('created_at', { ascending: false });
+      
+      if (error) {
+        console.error('Error fetching listings:', error);
+        return [];
+      }
+      return data || [];
     },
-    enabled: !!user?.email,
+    enabled: !!user?.id,
   });
 
   // Fetch user reviews
   const { data: userReviews = [] } = useQuery({
-    queryKey: ['user-reviews', user?.email],
+    queryKey: ['user-reviews', user?.id],
     queryFn: async () => {
-      if (!user?.email) return [];
-      return await base44.entities.UserReview.filter({ 
-        reviewed_user_email: user.email,
-        status: 'published'
-      }, '-created_date');
+      if (!user?.id) return [];
+      const { data, error } = await supabase
+        .from('user_reviews')
+        .select('*')
+        .eq('reviewed_user_id', user.id)
+        .eq('status', 'published')
+        .order('created_at', { ascending: false });
+      
+      if (error) {
+        console.error('Error fetching reviews:', error);
+        return [];
+      }
+      return data || [];
     },
-    enabled: !!user?.email,
+    enabled: !!user?.id,
   });
 
   // Fetch bookings where user is the guest
   const { data: myBookings = [] } = useQuery({
-    queryKey: ['profile-bookings', user?.email],
+    queryKey: ['profile-bookings', user?.id],
     queryFn: async () => {
-      if (!user?.email) return [];
-      return await base44.entities.Booking.filter({ guest_email: user.email }, '-created_date');
+      if (!user?.id) return [];
+      const { data, error } = await supabase
+        .from('bookings')
+        .select('*')
+        .eq('guest_id', user.id)
+        .order('created_at', { ascending: false });
+      
+      if (error) {
+        console.error('Error fetching bookings:', error);
+        return [];
+      }
+      return data || [];
     },
-    enabled: !!user?.email,
+    enabled: !!user?.id,
   });
 
   // Fetch bookings where user is the host
   const { data: hostBookings = [] } = useQuery({
-    queryKey: ['profile-host-bookings', user?.email],
+    queryKey: ['profile-host-bookings', user?.id],
     queryFn: async () => {
-      if (!user?.email) return [];
-      const myListingIds = myListings.map(l => l.id);
-      if (myListingIds.length === 0) return [];
-      const allBookings = await base44.entities.Booking.list('-created_date', 100);
-      return allBookings.filter(b => myListingIds.includes(b.listing_id));
+      if (!user?.id || myListings.length === 0) return [];
+      const listingIds = myListings.map(l => l.id);
+      
+      const { data, error } = await supabase
+        .from('bookings')
+        .select('*')
+        .in('listing_id', listingIds)
+        .order('created_at', { ascending: false });
+      
+      if (error) {
+        console.error('Error fetching host bookings:', error);
+        return [];
+      }
+      return data || [];
     },
-    enabled: !!user?.email && myListings.length > 0,
+    enabled: !!user?.id && myListings.length > 0,
   });
 
+
+  // Update profile mutation
   const updateProfileMutation = useMutation({
     mutationFn: async (data) => {
-      return await base44.auth.updateMe(data);
+      const { error } = await supabase
+        .from('users')
+        .upsert({
+          id: user.id,
+          email: user.email,
+          ...data,
+          updated_at: new Date().toISOString()
+        });
+      
+      if (error) throw error;
+      return data;
     },
-    onSuccess: async () => {
-      // Refetch user data to ensure we have the latest
-      const refreshedUser = await base44.auth.me();
-      setUser(refreshedUser);
-      setEditedName(refreshedUser.full_name || '');
-      setEditedPhone(refreshedUser.phone_number || '');
-      setEditedAddress(refreshedUser.address || '');
-      setEditedCity(refreshedUser.city || '');
-      setEditedState(refreshedUser.state || '');
-      setEditedZip(refreshedUser.zip_code || '');
-      setEditedCountry(refreshedUser.country || '');
-      setEditedBio(refreshedUser.bio || '');
-      setEditedHowHeard(refreshedUser.how_heard_about_us || '');
-      setEditedNewsletter(refreshedUser.receive_newsletter || false);
-      setEditedSocialInstagram(refreshedUser.social_instagram || '');
-      setEditedSocialFacebook(refreshedUser.social_facebook || '');
-      setEditedSocialTwitter(refreshedUser.social_twitter || '');
-      setEditedSocialLinkedin(refreshedUser.social_linkedin || '');
-      setEditedSocialTiktok(refreshedUser.social_tiktok || '');
+    onSuccess: async (data) => {
+      // Refetch user profile
+      const { data: profile } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', user.id)
+        .single();
+      
+      if (profile) {
+        setUserProfile(profile);
+        initializeEditFields(profile);
+      }
+      
       setIsEditing(false);
       queryClient.invalidateQueries({ queryKey: ['user'] });
       queryClient.invalidateQueries({ queryKey: ['profile-listings'] });
+      toast.success('Profile updated successfully');
     },
     onError: (error) => {
       console.error('Failed to update profile:', error);
-      alert('Failed to update profile. Please try again.');
+      toast.error('Failed to update profile. Please try again.');
     },
   });
 
+  // Delete listing mutation
   const deleteListingMutation = useMutation({
     mutationFn: async (listingId) => {
-      await base44.entities.Listing.delete(listingId);
+      const { error } = await supabase
+        .from('listings')
+        .delete()
+        .eq('id', listingId);
+      
+      if (error) throw error;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['profile-listings'] });
@@ -176,9 +273,15 @@ export default function Profile() {
     },
   });
 
+  // Bulk delete mutation
   const bulkDeleteMutation = useMutation({
     mutationFn: async (listingIds) => {
-      await Promise.all(listingIds.map(id => base44.entities.Listing.delete(id)));
+      const { error } = await supabase
+        .from('listings')
+        .delete()
+        .in('id', listingIds);
+      
+      if (error) throw error;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['profile-listings'] });
@@ -191,9 +294,15 @@ export default function Profile() {
     },
   });
 
+  // Bulk update status mutation
   const bulkUpdateStatusMutation = useMutation({
     mutationFn: async ({ listingIds, status }) => {
-      await Promise.all(listingIds.map(id => base44.entities.Listing.update(id, { status })));
+      const { error } = await supabase
+        .from('listings')
+        .update({ status, updated_at: new Date().toISOString() })
+        .in('id', listingIds);
+      
+      if (error) throw error;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['profile-listings'] });
@@ -206,15 +315,24 @@ export default function Profile() {
     },
   });
 
+  // Duplicate listing mutation
   const duplicateListingMutation = useMutation({
     mutationFn: async (listing) => {
-      const { id, created_date, updated_date, created_by, ...listingData } = listing;
-      const duplicated = await base44.entities.Listing.create({
-        ...listingData,
-        title: `${listing.title} (Copy)`,
-        status: 'draft'
-      });
-      return duplicated;
+      const { id, created_at, updated_at, created_by, ...listingData } = listing;
+      
+      const { data, error } = await supabase
+        .from('listings')
+        .insert({
+          ...listingData,
+          title: `${listing.title} (Copy)`,
+          status: 'draft',
+          created_by: user.id
+        })
+        .select()
+        .single();
+      
+      if (error) throw error;
+      return data;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['profile-listings'] });
@@ -261,21 +379,13 @@ export default function Profile() {
     );
   };
 
-  const toggleSelectAll = () => {
-    if (selectedListings.length === filteredListings.length) {
-      setSelectedListings([]);
-    } else {
-      setSelectedListings(filteredListings.map(l => l.id));
-    }
-  };
-
   const handleEditListing = (listing) => {
     window.location.href = `${createPageUrl('CreateListing')}?edit=${listing.id}`;
   };
 
   const handleSaveProfile = () => {
     if (!editedName || editedName.trim().length === 0) {
-      alert('Name cannot be empty');
+      toast.error('Name cannot be empty');
       return;
     }
     updateProfileMutation.mutate({ 
@@ -297,7 +407,29 @@ export default function Profile() {
     });
   };
 
-  if (!isAuthenticated || !user) {
+
+  // Filter helpers
+  const toggleSelectAll = () => {
+    if (selectedListings.length === filteredListings.length) {
+      setSelectedListings([]);
+    } else {
+      setSelectedListings(filteredListings.map(l => l.id));
+    }
+  };
+
+  // Loading state
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <Header />
+        <div className="pt-24 flex items-center justify-center h-[60vh]">
+          <Loader2 className="w-8 h-8 animate-spin text-[#FF5124]" />
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated || !userProfile) {
     return (
       <div className="min-h-screen bg-gray-50">
         <Header />
@@ -335,6 +467,14 @@ export default function Profile() {
     cancelled: 'bg-red-100 text-red-800',
   };
 
+  // Combined user data for display (profile takes precedence)
+  const displayUser = {
+    ...user,
+    ...userProfile,
+    identity_verified: userProfile?.identity_verification_status === 'verified',
+    created_date: userProfile?.created_at || user?.created_at
+  };
+
   return (
     <div className="min-h-screen bg-gray-50">
       <Header />
@@ -346,9 +486,9 @@ export default function Profile() {
             <div className="flex items-center gap-4 mb-2">
               <div className="w-16 h-16 bg-[#FF5124] rounded-full flex items-center justify-center relative">
                 <span className="text-white text-2xl font-bold">
-                  {user.full_name?.charAt(0) || 'U'}
+                  {displayUser.full_name?.charAt(0) || 'U'}
                 </span>
-                {user.identity_verified && (
+                {displayUser.identity_verified && (
                   <div className="absolute -bottom-1 -right-1 w-6 h-6 bg-green-500 rounded-full flex items-center justify-center border-2 border-white">
                     <CheckCircle className="w-4 h-4 text-white" />
                   </div>
@@ -356,15 +496,15 @@ export default function Profile() {
               </div>
               <div>
                 <div className="flex items-center gap-2">
-                  <h1 className="text-3xl font-bold text-slate-900">{user.full_name || 'User'}</h1>
-                  {user.identity_verified && (
+                  <h1 className="text-3xl font-bold text-slate-900">{displayUser.full_name || 'User'}</h1>
+                  {displayUser.identity_verified && (
                     <Badge className="bg-green-100 text-green-800 border-green-200">
                       <CheckCircle className="w-3 h-3 mr-1" />
                       Verified
                     </Badge>
                   )}
                 </div>
-                <p className="text-slate-500">{user.email}</p>
+                <p className="text-slate-500">{displayUser.email}</p>
               </div>
             </div>
           </div>
@@ -388,8 +528,7 @@ export default function Profile() {
                     ) : null}
                   </div>
                 </CardHeader>
-                <CardContent className="space-y-4">
-                  {isEditing ? (
+                <CardContent className="space-y-4">{isEditing ? (
                     <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2">
                       <div>
                         <Label>Full Name *</Label>
@@ -485,6 +624,7 @@ export default function Profile() {
                         </Label>
                       </div>
 
+
                       <div className="pt-2">
                         <Label className="text-sm font-semibold">Social Media (Optional)</Label>
                         <div className="space-y-2 mt-2">
@@ -548,21 +688,7 @@ export default function Profile() {
                           variant="outline"
                           onClick={() => {
                             setIsEditing(false);
-                            setEditedName(user.full_name || '');
-                            setEditedPhone(user.phone_number || '');
-                            setEditedAddress(user.address || '');
-                            setEditedCity(user.city || '');
-                            setEditedState(user.state || '');
-                            setEditedZip(user.zip_code || '');
-                            setEditedCountry(user.country || '');
-                            setEditedBio(user.bio || '');
-                            setEditedHowHeard(user.how_heard_about_us || '');
-                            setEditedNewsletter(user.receive_newsletter || false);
-                            setEditedSocialInstagram(user.social_instagram || '');
-                            setEditedSocialFacebook(user.social_facebook || '');
-                            setEditedSocialTwitter(user.social_twitter || '');
-                            setEditedSocialLinkedin(user.social_linkedin || '');
-                            setEditedSocialTiktok(user.social_tiktok || '');
+                            initializeEditFields(userProfile);
                           }}
                         >
                           <X className="w-4 h-4" />
@@ -575,46 +701,46 @@ export default function Profile() {
                         <User className="w-5 h-5 text-slate-400" />
                         <div>
                           <p className="text-xs text-slate-500">Full Name</p>
-                          <p className="font-medium text-slate-900">{user.full_name || 'Not set'}</p>
+                          <p className="font-medium text-slate-900">{displayUser.full_name || 'Not set'}</p>
                         </div>
                       </div>
                       <div className="flex items-center gap-3 text-slate-600">
                         <Mail className="w-5 h-5 text-slate-400" />
                         <div>
                           <p className="text-xs text-slate-500">Email</p>
-                          <p className="font-medium text-slate-900">{user.email}</p>
+                          <p className="font-medium text-slate-900">{displayUser.email}</p>
                         </div>
                       </div>
                       
-                      {user.phone_number && (
+                      {displayUser.phone_number && (
                         <div className="flex items-center gap-3 text-slate-600">
                           <Phone className="w-5 h-5 text-slate-400" />
                           <div>
                             <p className="text-xs text-slate-500">Phone</p>
-                            <p className="font-medium text-slate-900">{user.phone_number}</p>
+                            <p className="font-medium text-slate-900">{displayUser.phone_number}</p>
                           </div>
                         </div>
                       )}
 
-                      {(user.address || user.city) && (
+                      {(displayUser.address || displayUser.city) && (
                         <div className="flex items-start gap-3 text-slate-600">
                           <Home className="w-5 h-5 text-slate-400 mt-0.5" />
                           <div>
                             <p className="text-xs text-slate-500">Address</p>
                             <p className="font-medium text-slate-900 text-sm">
-                              {user.address && <>{user.address}<br /></>}
-                              {user.city && user.state && `${user.city}, ${user.state} `}
-                              {user.zip_code}
-                              {user.country && <><br />{user.country}</>}
+                              {displayUser.address && <>{displayUser.address}<br /></>}
+                              {displayUser.city && displayUser.state && `${displayUser.city}, ${displayUser.state} `}
+                              {displayUser.zip_code}
+                              {displayUser.country && <><br />{displayUser.country}</>}
                             </p>
                           </div>
                         </div>
                       )}
 
-                      {user.bio && (
+                      {displayUser.bio && (
                         <div className="p-3 bg-slate-50 rounded-lg">
                           <p className="text-xs text-slate-500 mb-1">Bio</p>
-                          <p className="text-sm text-slate-900">{user.bio}</p>
+                          <p className="text-sm text-slate-900">{displayUser.bio}</p>
                         </div>
                       )}
                       
@@ -622,7 +748,7 @@ export default function Profile() {
                         <Shield className="w-5 h-5 text-slate-400" />
                         <div>
                           <p className="text-xs text-slate-500">Role</p>
-                          <Badge className="mt-1 capitalize">{user.role || 'user'}</Badge>
+                          <Badge className="mt-1 capitalize">{displayUser.role || 'user'}</Badge>
                         </div>
                       </div>
                       <div className="flex items-center gap-3 text-slate-600">
@@ -630,41 +756,41 @@ export default function Profile() {
                         <div>
                           <p className="text-xs text-slate-500">Member Since</p>
                           <p className="font-medium text-slate-900">
-                            {format(new Date(user.created_date), 'MMM yyyy')}
+                            {displayUser.created_date ? format(new Date(displayUser.created_date), 'MMM yyyy') : 'N/A'}
                           </p>
                         </div>
                       </div>
 
-                      {(user.social_instagram || user.social_facebook || user.social_twitter || user.social_linkedin || user.social_tiktok) && (
+                      {(displayUser.social_instagram || displayUser.social_facebook || displayUser.social_twitter || displayUser.social_linkedin || displayUser.social_tiktok) && (
                         <div className="pt-2">
                           <p className="text-xs text-slate-500 mb-2">Social Media</p>
                           <div className="flex gap-2 flex-wrap">
-                            {user.social_instagram && (
-                              <a href={user.social_instagram} target="_blank" rel="noopener noreferrer" 
+                            {displayUser.social_instagram && (
+                              <a href={displayUser.social_instagram} target="_blank" rel="noopener noreferrer" 
                                 className="w-8 h-8 bg-gradient-to-br from-purple-600 to-pink-500 rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity">
                                 <Instagram className="w-4 h-4 text-white" />
                               </a>
                             )}
-                            {user.social_facebook && (
-                              <a href={user.social_facebook} target="_blank" rel="noopener noreferrer"
+                            {displayUser.social_facebook && (
+                              <a href={displayUser.social_facebook} target="_blank" rel="noopener noreferrer"
                                 className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity">
                                 <Facebook className="w-4 h-4 text-white" />
                               </a>
                             )}
-                            {user.social_twitter && (
-                              <a href={user.social_twitter} target="_blank" rel="noopener noreferrer"
+                            {displayUser.social_twitter && (
+                              <a href={displayUser.social_twitter} target="_blank" rel="noopener noreferrer"
                                 className="w-8 h-8 bg-black rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity">
                                 <Twitter className="w-4 h-4 text-white" />
                               </a>
                             )}
-                            {user.social_linkedin && (
-                              <a href={user.social_linkedin} target="_blank" rel="noopener noreferrer"
+                            {displayUser.social_linkedin && (
+                              <a href={displayUser.social_linkedin} target="_blank" rel="noopener noreferrer"
                                 className="w-8 h-8 bg-blue-700 rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity">
                                 <Linkedin className="w-4 h-4 text-white" />
                               </a>
                             )}
-                            {user.social_tiktok && (
-                              <a href={user.social_tiktok} target="_blank" rel="noopener noreferrer"
+                            {displayUser.social_tiktok && (
+                              <a href={displayUser.social_tiktok} target="_blank" rel="noopener noreferrer"
                                 className="w-8 h-8 bg-black rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity">
                                 <MessageSquare className="w-4 h-4 text-white" />
                               </a>
@@ -677,11 +803,12 @@ export default function Profile() {
                 </CardContent>
               </Card>
 
+
               {/* Identity Verification Section */}
               {!isEditing && (
                 <div className="mt-6 relative">
                   {/* Show blurred/locked state if profile incomplete */}
-                  {!(user.full_name && user.phone_number && user.address) && (
+                  {!(displayUser.full_name && displayUser.phone_number && displayUser.address) && (
                     <div className="absolute inset-0 bg-white/80 backdrop-blur-sm z-10 rounded-xl flex items-center justify-center">
                       <Card className="border-blue-200 bg-blue-50 shadow-lg max-w-md">
                         <CardContent className="p-6">
@@ -706,8 +833,8 @@ export default function Profile() {
                     </div>
                   )}
                   {/* Always render the component (blurred when locked) */}
-                  <div className={!(user.full_name && user.phone_number && user.address) ? 'opacity-30 pointer-events-none' : ''}>
-                    <StripeIdentityVerification user={user} />
+                  <div className={!(displayUser.full_name && displayUser.phone_number && displayUser.address) ? 'opacity-30 pointer-events-none' : ''}>
+                    <StripeIdentityVerification user={displayUser} />
                   </div>
                 </div>
               )}
@@ -828,6 +955,7 @@ export default function Profile() {
                           </Select>
                         </div>
 
+
                         {/* Bulk Actions */}
                         {selectedListings.length > 0 && (
                           <div className="flex items-center gap-2 p-3 bg-blue-50 rounded-lg border border-blue-200">
@@ -902,7 +1030,7 @@ export default function Profile() {
                           {/* Select All */}
                           <div className="flex items-center gap-2 p-3 bg-gray-50 rounded-lg">
                             <Checkbox
-                              checked={selectedListings.length === filteredListings.length}
+                              checked={selectedListings.length === filteredListings.length && filteredListings.length > 0}
                               onCheckedChange={toggleSelectAll}
                             />
                             <span className="text-sm text-slate-600">Select all</span>
@@ -1011,6 +1139,7 @@ export default function Profile() {
                     </CardContent>
                   </Card>
                 </TabsContent>
+
 
                 {/* My Bookings Tab */}
                 <TabsContent value="bookings" className="mt-6">
